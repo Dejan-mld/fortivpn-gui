@@ -14,6 +14,7 @@ gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 
 import json
+import os
 import sys
 import signal
 import subprocess
@@ -73,6 +74,30 @@ CSS = b"""
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("fortivpn")
+
+
+# ---------------------------------------------------------------------------
+# Flatpak sandbox awareness
+#
+# When the app runs inside a Flatpak sandbox we cannot exec openfortivpn
+# directly: it needs root and access to /dev/net/tun on the host.  Every
+# privileged command must therefore be routed through `flatpak-spawn --host`
+# (which talks to the org.freedesktop.Flatpak portal — finish-args grants the
+# `--talk-name=org.freedesktop.Flatpak` permission for exactly this).
+#
+# The native install path is unchanged: outside Flatpak `host_cmd` is a
+# no-op, so subprocess invocations look identical to before.
+# ---------------------------------------------------------------------------
+
+def is_flatpak() -> bool:
+    return Path("/.flatpak-info").exists() or bool(os.environ.get("FLATPAK_ID"))
+
+
+def host_cmd(cmd: list[str]) -> list[str]:
+    """Wrap a command list so it runs on the host when we are sandboxed."""
+    if is_flatpak():
+        return ["flatpak-spawn", "--host"] + cmd
+    return cmd
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +170,18 @@ class VPNController:
 
     @staticmethod
     def find_binary() -> str | None:
+        # Inside Flatpak `shutil.which` only sees the sandbox PATH where
+        # openfortivpn is absent. Ask the host instead.
+        if is_flatpak():
+            try:
+                r = subprocess.run(
+                    ["flatpak-spawn", "--host", "which", "openfortivpn"],
+                    capture_output=True, text=True, timeout=5, check=False,
+                )
+                path = r.stdout.strip().splitlines()[0] if r.stdout.strip() else ""
+                return path or None
+            except Exception:
+                return None
         return shutil.which("openfortivpn")
 
     def connect(self, host: str, port: str, saml: bool = True,
@@ -178,14 +215,17 @@ class VPNController:
         # We use sudo instead of pkexec because pkexec does NOT relay
         # stdout/stderr back to the calling process reliably.
         # The installer's fix-sudo command sets up NOPASSWD for openfortivpn.
-        cmd = ["sudo", "--non-interactive", binary] + vpn_args
+        # Inside Flatpak the whole thing is wrapped by flatpak-spawn --host so
+        # the actual openfortivpn execution happens on the host (it needs
+        # /dev/net/tun and root, neither of which exist in the sandbox).
+        cmd = host_cmd(["sudo", "--non-interactive", binary] + vpn_args)
 
         # If sudo non-interactive fails (no NOPASSWD rule), fall back to pkexec
         self._use_pkexec_fallback = False
         self._binary = binary
         self._vpn_args = vpn_args
 
-        self._emit_log(f">> Starting: sudo {binary} {' '.join(vpn_args)}")
+        self._emit_log(f">> Starting: {' '.join(cmd)}")
         self._stop.clear()
         self.bytes_tx = 0
         self.bytes_rx = 0
@@ -268,7 +308,7 @@ class VPNController:
             except Exception:
                 pass
             self._emit_log(">> Retrying with pkexec (you will see a password dialog)...")
-            cmd = ["pkexec", self._binary] + self._vpn_args
+            cmd = host_cmd(["pkexec", self._binary] + self._vpn_args)
             self._emit_log(f">> Starting: {' '.join(cmd)}")
             try:
                 self.process = subprocess.Popen(
@@ -365,14 +405,18 @@ class VPNController:
             pid = self.process.pid
             # Try sending SIGINT to the process group (openfortivpn runs as root)
             try:
-                # First try sudo kill (works if NOPASSWD is set up)
-                subprocess.run(["sudo", "--non-interactive", "kill", "-INT", str(pid)],
+                # First try sudo kill (works if NOPASSWD is set up).
+                # Note: inside Flatpak, `pid` is the local flatpak-spawn pid,
+                # not the host openfortivpn pid. flatpak-spawn forwards the
+                # signal to its host child, so this still terminates the
+                # tunnel correctly.
+                subprocess.run(host_cmd(["sudo", "--non-interactive", "kill", "-INT", str(pid)]),
                                timeout=3, check=False, capture_output=True)
             except Exception:
                 pass
             try:
                 # Also try pkexec kill as fallback
-                subprocess.run(["pkexec", "kill", "-INT", str(pid)],
+                subprocess.run(host_cmd(["pkexec", "kill", "-INT", str(pid)]),
                                timeout=5, check=False, capture_output=True)
             except Exception:
                 pass

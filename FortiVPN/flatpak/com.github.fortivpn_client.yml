@@ -1,0 +1,45 @@
+app-id: com.github.fortivpn_client
+runtime: org.gnome.Platform
+runtime-version: '46'
+sdk: org.gnome.Sdk
+command: fortivpn-client
+
+finish-args:
+  # SAML round-trip needs the network; openfortivpn itself runs on the host.
+  - --share=network
+  # GUI sockets — Wayland with X11 fallback is what GNOME apps ship with today.
+  - --socket=wayland
+  - --socket=fallback-x11
+  # GPU access for GTK4 rendering.
+  - --device=dri
+  # flatpak-spawn --host needs to talk to the Flatpak session helper. This is
+  # how every privileged call (sudo / pkexec / openfortivpn) reaches the host.
+  - --talk-name=org.freedesktop.Flatpak
+  # Profile storage. Created on first run, owned by the user, sandboxed.
+  - --filesystem=xdg-config/fortivpn-client:create
+
+modules:
+  - name: fortivpn-client
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 launcher.sh /app/bin/fortivpn-client
+      - install -Dm644 fortivpn_client.py /app/share/fortivpn-client/fortivpn_client.py
+      - install -Dm644 com.github.fortivpn_client.svg
+        /app/share/icons/hicolor/scalable/apps/com.github.fortivpn_client.svg
+      - install -Dm644 com.github.fortivpn_client.desktop
+        /app/share/applications/com.github.fortivpn_client.desktop
+      - install -Dm644 com.github.fortivpn_client.metainfo.xml
+        /app/share/metainfo/com.github.fortivpn_client.metainfo.xml
+    sources:
+      - type: file
+        path: ../fortivpn_client.py
+      - type: file
+        path: ../com.github.fortivpn_client.svg
+      - type: file
+        path: com.github.fortivpn_client.desktop
+      - type: file
+        path: com.github.fortivpn_client.metainfo.xml
+      - type: script
+        dest-filename: launcher.sh
+        commands:
+          - exec python3 /app/share/fortivpn-client/fortivpn_client.py "$@"

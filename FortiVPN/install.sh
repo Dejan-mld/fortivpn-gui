@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # ============================================================================
 # FortiVPN Client — Universal Installer
-# Supports: Ubuntu/Debian, Fedora/RHEL/CentOS, Arch Linux, openSUSE
+# Supports: Ubuntu/Debian, Fedora/RHEL/CentOS, Arch Linux, openSUSE,
+#           Alpine Linux, Void Linux. Hints for Gentoo and NixOS.
+# Long-tail / unknown distros: prints required components and points to the
+# Flatpak (FortiVPN/flatpak/) which works identically on every distribution.
 # ============================================================================
 set -euo pipefail
 
@@ -37,6 +40,41 @@ detect_distro() {
         error "Cannot detect distribution. Install manually."
     fi
     info "Detected: $DISTRO_ID ($DISTRO_LIKE)"
+
+    # NixOS bails out before any package work — install.sh cannot manage Nix.
+    if [ -f /etc/NIXOS ] || [ "$DISTRO_ID" = "nixos" ]; then
+        echo ""
+        warn "NixOS detected."
+        warn "install.sh cannot manage packages on NixOS."
+        warn "Use one of:"
+        warn "  • Flatpak (recommended):  see FortiVPN/flatpak/README.md"
+        warn "  • Write a flake / package: bundle openfortivpn + python3 +"
+        warn "    pygobject3 + gtk4 + libadwaita + polkit yourself."
+        error "Aborting on NixOS."
+    fi
+}
+
+# ---- Sanity: openfortivpn must be present after dep install ----
+require_openfortivpn() {
+    if ! command -v openfortivpn &>/dev/null; then
+        error "openfortivpn was not installed/found in PATH. Install it via your package manager and re-run, or use the Flatpak."
+    fi
+}
+
+# ---- Sanity: Python >= 3.10 (Adw.NavigationView, modern libadwaita bits) ----
+require_python_310() {
+    if ! command -v python3 &>/dev/null; then
+        error "python3 not found. Install Python >= 3.10 and re-run."
+    fi
+    local pyver
+    pyver=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "0.0")
+    local major minor
+    major="${pyver%%.*}"
+    minor="${pyver##*.}"
+    if [ "${major:-0}" -lt 3 ] || { [ "${major:-0}" -eq 3 ] && [ "${minor:-0}" -lt 10 ]; }; then
+        error "Python $pyver is too old. FortiVPN Client requires Python >= 3.10 (Adw.NavigationView and a recent libadwaita)."
+    fi
+    info "Python $pyver — OK."
 }
 
 # ---- Package manager helpers ----
@@ -99,6 +137,79 @@ install_packages_zypper() {
         polkit
 }
 
+install_packages_apk() {
+    info "Installing dependencies via apk (Alpine)..."
+    # Alpine commonly ships doas instead of sudo — apk root invocation handled
+    # by whichever wrapper exists.
+    local SU
+    SU=$(_pick_root_helper)
+    $SU apk add --no-cache \
+        openfortivpn \
+        python3 \
+        py3-gobject3 \
+        gtk4.0 \
+        libadwaita \
+        polkit
+}
+
+install_packages_xbps() {
+    info "Installing dependencies via xbps-install (Void)..."
+    local SU
+    SU=$(_pick_root_helper)
+    $SU xbps-install -Sy \
+        openfortivpn \
+        python3 \
+        python3-gobject \
+        gtk4 \
+        libadwaita \
+        polkit
+}
+
+# Gentoo: print suggested ebuilds; do NOT auto-emerge (USE flags are user choice).
+install_packages_gentoo_hint() {
+    warn "Gentoo detected — auto-emerge is intentionally disabled."
+    warn "Suggested ebuilds (review USE flags first):"
+    warn "  net-vpn/openfortivpn"
+    warn "  dev-lang/python  (>=3.10)"
+    warn "  dev-python/pygobject"
+    warn "  gui-libs/gtk:4"
+    warn "  gui-libs/libadwaita"
+    warn "  sys-auth/polkit"
+    warn ""
+    warn "Then re-run: ./install.sh install   to copy app files into place."
+}
+
+# Generic fallback when we cannot identify the package manager.
+generic_fallback_message() {
+    warn "No supported package manager matched."
+    warn ""
+    warn "Install these components with whatever your distro provides:"
+    warn "  • openfortivpn          (>= 1.17)"
+    warn "  • python3               (>= 3.10)"
+    warn "  • PyGObject             (python3-gi / py3-gobject3 / python-gobject)"
+    warn "  • GTK 4                 (gtk4 / gtk4.0)"
+    warn "  • libadwaita            (>= 1.4 for Adw.NavigationView)"
+    warn "  • polkit                (for pkexec; or doas + sudoers as alt)"
+    warn ""
+    warn "Or skip distro packaging entirely and use the Flatpak — it works"
+    warn "identically on every distribution:"
+    warn "  see FortiVPN/flatpak/README.md"
+}
+
+# Pick `sudo` or `doas` (Alpine/Void typically use doas). Fall back to running
+# as root directly if neither exists and uid==0.
+_pick_root_helper() {
+    if command -v sudo &>/dev/null; then
+        echo "sudo"
+    elif command -v doas &>/dev/null; then
+        echo "doas"
+    elif [ "$(id -u)" -eq 0 ]; then
+        echo ""
+    else
+        error "Neither sudo nor doas is installed, and you are not root."
+    fi
+}
+
 install_deps() {
     case "$DISTRO_ID" in
         ubuntu|debian|linuxmint|pop|elementary|zorin)
@@ -109,20 +220,32 @@ install_deps() {
             install_packages_pacman ;;
         opensuse*|sles)
             install_packages_zypper ;;
+        alpine)
+            install_packages_apk ;;
+        void)
+            install_packages_xbps ;;
+        gentoo)
+            install_packages_gentoo_hint
+            return 0 ;;
         *)
             case "$DISTRO_LIKE" in
                 *debian*|*ubuntu*)  install_packages_apt ;;
                 *fedora*|*rhel*)    install_packages_dnf ;;
                 *arch*)             install_packages_pacman ;;
                 *suse*)             install_packages_zypper ;;
+                *alpine*)           install_packages_apk ;;
+                *void*)             install_packages_xbps ;;
+                *gentoo*)           install_packages_gentoo_hint; return 0 ;;
                 *)
-                    warn "Unknown distribution '$DISTRO_ID'. Attempting to continue..."
-                    warn "You may need to install dependencies manually:"
-                    warn "  openfortivpn, python3, python3-gi, gtk4, libadwaita"
-                    ;;
+                    generic_fallback_message
+                    return 0 ;;
             esac
             ;;
     esac
+
+    # After any real install, openfortivpn must be present.
+    require_openfortivpn
+    require_python_310
 }
 
 # ---- Install application files ----
@@ -272,9 +395,10 @@ fix_permissions() {
 fix_sudo() {
     info "Setting up passwordless openfortivpn via polkit + sudoers..."
 
-    # 1. Polkit rule (for pkexec)
-    sudo mkdir -p "/etc/polkit-1/rules.d"
-    sudo tee "/etc/polkit-1/rules.d/50-$APP_NAME.rules" > /dev/null << 'POLKIT'
+    # 1. Polkit rule (for pkexec) — works regardless of sudo/doas choice.
+    sudo mkdir -p "/etc/polkit-1/rules.d" 2>/dev/null \
+        || doas mkdir -p "/etc/polkit-1/rules.d"
+    _root_tee "/etc/polkit-1/rules.d/50-$APP_NAME.rules" << 'POLKIT'
 polkit.addRule(function(action, subject) {
     if (action.id == "org.freedesktop.policykit.exec" &&
         (action.lookup("program") == "/usr/bin/openfortivpn" ||
@@ -284,24 +408,31 @@ polkit.addRule(function(action, subject) {
     }
 });
 POLKIT
-    sudo chmod 644 "/etc/polkit-1/rules.d/50-$APP_NAME.rules"
+    _root_chmod 644 "/etc/polkit-1/rules.d/50-$APP_NAME.rules"
     success "Polkit rule installed: openfortivpn via pkexec without password."
 
-    # 2. Sudoers rule (as fallback / alternative)
-    OPENFORTIVPN_PATH=$(command -v openfortivpn 2>/dev/null || echo "/usr/bin/openfortivpn")
-    sudo tee "/etc/sudoers.d/fortivpn-client" > /dev/null << SUDOERS
+    # 2. Sudoers rule — only if `sudo` is the system's privilege tool.
+    # Alpine/Void typically use doas; configuring sudoers on those is wrong.
+    if ! command -v sudo &>/dev/null && command -v doas &>/dev/null; then
+        warn "System uses doas (no sudo found) — skipping sudoers step."
+        warn "If you want passwordless openfortivpn under doas, add to /etc/doas.conf:"
+        warn "  permit nopass :wheel cmd $(command -v openfortivpn 2>/dev/null || echo openfortivpn)"
+    else
+        OPENFORTIVPN_PATH=$(command -v openfortivpn 2>/dev/null || echo "/usr/bin/openfortivpn")
+        sudo tee "/etc/sudoers.d/fortivpn-client" > /dev/null << SUDOERS
 # Allow members of wheel/sudo to run openfortivpn without password
 %wheel ALL=(root) NOPASSWD: $OPENFORTIVPN_PATH
 %sudo  ALL=(root) NOPASSWD: $OPENFORTIVPN_PATH
 SUDOERS
-    sudo chmod 440 "/etc/sudoers.d/fortivpn-client"
+        sudo chmod 440 "/etc/sudoers.d/fortivpn-client"
 
-    # Validate sudoers
-    if sudo visudo -cf "/etc/sudoers.d/fortivpn-client" &>/dev/null; then
-        success "Sudoers rule installed: $OPENFORTIVPN_PATH without password."
-    else
-        warn "Sudoers syntax check failed — removing the rule."
-        sudo rm -f "/etc/sudoers.d/fortivpn-client"
+        # Validate sudoers
+        if sudo visudo -cf "/etc/sudoers.d/fortivpn-client" &>/dev/null; then
+            success "Sudoers rule installed: $OPENFORTIVPN_PATH without password."
+        else
+            warn "Sudoers syntax check failed — removing the rule."
+            sudo rm -f "/etc/sudoers.d/fortivpn-client"
+        fi
     fi
 
     echo ""
@@ -314,6 +445,29 @@ SUDOERS
         warn "  sudo usermod -aG wheel \$USER   # Fedora/Arch"
         warn "  sudo usermod -aG sudo \$USER    # Ubuntu/Debian"
         warn "Then log out and back in."
+    fi
+}
+
+# Tee a heredoc into a root-owned file using whichever helper is available.
+_root_tee() {
+    local target="$1"
+    if command -v sudo &>/dev/null; then
+        sudo tee "$target" > /dev/null
+    elif command -v doas &>/dev/null; then
+        doas tee "$target" > /dev/null
+    else
+        tee "$target" > /dev/null
+    fi
+}
+
+_root_chmod() {
+    local mode="$1"; shift
+    if command -v sudo &>/dev/null; then
+        sudo chmod "$mode" "$@"
+    elif command -v doas &>/dev/null; then
+        doas chmod "$mode" "$@"
+    else
+        chmod "$mode" "$@"
     fi
 }
 

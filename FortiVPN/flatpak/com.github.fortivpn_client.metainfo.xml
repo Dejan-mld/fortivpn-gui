@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.github.fortivpn_client</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <name>FortiVPN Client</name>
+  <summary>SAML-based OpenFortiVPN client for GNOME</summary>
+
+  <description>
+    <p>
+      A native GNOME front-end for openfortivpn with first-class SAML / SSO
+      support. The GUI manages multiple VPN profiles, opens your default
+      browser for SAML authentication via openfortivpn's built-in
+      --saml-login flow, and shows live tunnel traffic in a libadwaita
+      window.
+    </p>
+    <p>
+      The Flatpak build delegates the actual privileged openfortivpn
+      invocation to the host system via flatpak-spawn, so the tunnel runs
+      where it has to (root, /dev/net/tun) while the UI stays sandboxed.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>SAML / SSO login (Azure AD, Okta, Google Workspace, …)</li>
+      <li>Multiple saved profiles with realm and trusted-cert support</li>
+      <li>Real-time tunnel traffic counters</li>
+      <li>System-tray status icon (when the AppIndicator GI is available)</li>
+      <li>GTK 4 + libadwaita native look</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">com.github.fortivpn_client.desktop</launchable>
+
+  <url type="homepage">https://github.com/fortivpn-client/fortivpn-client</url>
+  <url type="bugtracker">https://github.com/fortivpn-client/fortivpn-client/issues</url>
+
+  <developer_name>FortiVPN Client Contributors</developer_name>
+
+  <categories>
+    <category>Network</category>
+    <category>Security</category>
+  </categories>
+
+  <keywords>
+    <keyword>vpn</keyword>
+    <keyword>fortinet</keyword>
+    <keyword>saml</keyword>
+    <keyword>sso</keyword>
+    <keyword>openfortivpn</keyword>
+  </keywords>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="1.2.0" date="2026-04-30">
+      <description>
+        <p>Universal distro support: Alpine and Void packages, Gentoo
+        ebuild hint, NixOS abort with Flatpak pointer, Flatpak manifest
+        for cross-distro install. Sandbox-aware host_cmd() routes
+        privileged calls through flatpak-spawn --host.</p>
+      </description>
+    </release>
+  </releases>
+
+  <provides>
+    <binary>fortivpn-client</binary>
+  </provides>
+</component>

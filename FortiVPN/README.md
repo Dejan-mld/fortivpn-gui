@@ -36,18 +36,27 @@
 
 ## Installation
 
-### Quick Install (recommended)
+There are three supported install paths. Pick the one that matches your distro
+and how isolated you want the app to be:
+
+1. **Distro packages via `install.sh`** — native install, lightest footprint,
+   works on the major package managers.
+2. **Flatpak** — recommended cross-distro option; identical build everywhere,
+   sandboxed UI that delegates the privileged `openfortivpn` call to the host.
+3. **Manual** — install the components yourself; for unusual distros,
+   air-gapped systems, or when you want full control.
+
+### 1. Distro packages (install.sh)
 
 ```bash
 git clone https://github.com/fortivpn-client/fortivpn-client.git
 cd fortivpn-client
-chmod +x install.sh
-./install.sh install
+chmod +x FortiVPN/install.sh
+./FortiVPN/install.sh install
 ```
 
-The installer automatically detects your distribution and installs all dependencies.
-
-### Supported Distributions
+The installer automatically detects your distribution and installs all
+dependencies.
 
 | Distribution | Package Manager | Status |
 |---|---|---|
@@ -57,8 +66,30 @@ The installer automatically detects your distribution and installs all dependenc
 | openSUSE Tumbleweed | zypper | ✅ Tested |
 | Linux Mint / Pop!_OS | apt | ✅ Compatible |
 | RHEL 9+ / Rocky / Alma | dnf | ⚠️ May need EPEL |
+| Alpine Linux | apk | ✅ Supported |
+| Void Linux | xbps | ✅ Supported |
+| Gentoo | emerge | ℹ️ Prints ebuild hints — no auto-emerge |
+| NixOS | — | ❌ Aborts; use the Flatpak or write a flake |
+| Anything else | — | ⚠️ Prints required components and recommends Flatpak |
 
-### Manual Dependencies
+### 2. Flatpak (recommended for cross-distro)
+
+The Flatpak build works identically on every Linux distribution. The UI is
+sandboxed; the privileged `openfortivpn` invocation is forwarded to the host
+via `flatpak-spawn --host`, so the host system needs `openfortivpn` installed
+(any package manager, or built from source).
+
+```bash
+flatpak install --user flathub org.gnome.Platform//46 org.gnome.Sdk//46
+flatpak-builder --user --install --force-clean build \
+    FortiVPN/flatpak/com.github.fortivpn_client.yml
+flatpak run com.github.fortivpn_client
+```
+
+See [`FortiVPN/flatpak/README.md`](flatpak/README.md) for build details and
+the flatpak-spawn host-bridge design.
+
+### 3. Manual install
 
 If the installer doesn't cover your distro, install these manually:
 

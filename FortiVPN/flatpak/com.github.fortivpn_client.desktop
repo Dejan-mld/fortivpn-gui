@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=FortiVPN Client
+GenericName=VPN Client
+Comment=SAML-based OpenFortiVPN client for GNOME
+Exec=fortivpn-client
+Icon=com.github.fortivpn_client
+Terminal=false
+Categories=Network;Security;
+Keywords=vpn;fortinet;saml;sso;openfortivpn;
+StartupNotify=true
+X-GNOME-UsesNotifications=true
