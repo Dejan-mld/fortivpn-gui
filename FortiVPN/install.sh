@@ -61,6 +61,68 @@ require_openfortivpn() {
     fi
 }
 
+# ---- Guarantee openfortivpn is installed, installing it if missing ----
+# Safe to call from any entry point (install / fix-sudo / fix-permissions).
+# Detects the distro on demand and installs ONLY openfortivpn.
+ensure_openfortivpn() {
+    if command -v openfortivpn &>/dev/null; then
+        return 0
+    fi
+
+    info "openfortivpn not found in PATH — installing it now..."
+    if [ -z "${DISTRO_ID:-}" ]; then
+        detect_distro
+    fi
+
+    local SU
+    case "$DISTRO_ID" in
+        ubuntu|debian|linuxmint|pop|elementary|zorin)
+            sudo apt-get update -qq
+            sudo apt-get install -y openfortivpn ;;
+        fedora|rhel|centos|rocky|alma)
+            sudo dnf install -y openfortivpn ;;
+        arch|manjaro|endeavouros|garuda)
+            sudo pacman -Sy --noconfirm --needed openfortivpn ;;
+        opensuse*|sles)
+            sudo zypper install -y openfortivpn ;;
+        alpine)
+            SU=$(_pick_root_helper); $SU apk add openfortivpn ;;
+        void)
+            SU=$(_pick_root_helper); $SU xbps-install -Sy openfortivpn ;;
+        gentoo)
+            warn "Gentoo: install net-vpn/openfortivpn manually (review USE flags),"
+            warn "or use the Flatpak — see FortiVPN/flatpak/README.md."
+            error "openfortivpn is required and cannot be auto-installed on Gentoo." ;;
+        *)
+            case "$DISTRO_LIKE" in
+                *debian*|*ubuntu*)
+                    sudo apt-get update -qq
+                    sudo apt-get install -y openfortivpn ;;
+                *fedora*|*rhel*)
+                    sudo dnf install -y openfortivpn ;;
+                *arch*)
+                    sudo pacman -Sy --noconfirm --needed openfortivpn ;;
+                *suse*)
+                    sudo zypper install -y openfortivpn ;;
+                *alpine*)
+                    SU=$(_pick_root_helper); $SU apk add openfortivpn ;;
+                *void*)
+                    SU=$(_pick_root_helper); $SU xbps-install -Sy openfortivpn ;;
+                *)
+                    warn "Unknown distro ($DISTRO_ID / $DISTRO_LIKE) — cannot auto-install openfortivpn."
+                    warn "Install it manually with your distro's package manager, or use the"
+                    warn "Flatpak — see FortiVPN/flatpak/README.md."
+                    error "openfortivpn is required and could not be auto-installed." ;;
+            esac
+            ;;
+    esac
+
+    if ! command -v openfortivpn &>/dev/null; then
+        error "openfortivpn install appeared to succeed but the binary is still not in PATH. Install it manually or use the Flatpak."
+    fi
+    success "openfortivpn is installed: $(command -v openfortivpn)"
+}
+
 # ---- Sanity: Python >= 3.10 (Adw.NavigationView, modern libadwaita bits) ----
 require_python_310() {
     if ! command -v python3 &>/dev/null; then
@@ -244,8 +306,10 @@ install_deps() {
     esac
 
     # After any real install, openfortivpn must be present.
-    require_openfortivpn
     require_python_310
+    # Final guarantee: openfortivpn is the one binary the GUI cannot live without.
+    # If the bulk dep install above missed it for any reason, install it here.
+    ensure_openfortivpn
 }
 
 # ---- Install application files ----
@@ -377,6 +441,11 @@ SVG
 # ---- Fix permissions on installed files ----
 fix_permissions() {
     info "Fixing file permissions..."
+
+    # The GUI is useless without openfortivpn — guarantee it's installed
+    # rather than silently passing here.
+    ensure_openfortivpn
+
     sudo chmod 644 "$APP_DIR/fortivpn_client.py" 2>/dev/null || true
     sudo chmod 755 "$BIN_DIR/fortivpn-client" 2>/dev/null || true
     sudo chmod 644 "$SHARE_DIR/icons/hicolor/scalable/apps/$APP_ID.svg" 2>/dev/null || true
@@ -394,6 +463,9 @@ fix_permissions() {
 # ---- Fix sudo / polkit for openfortivpn ----
 fix_sudo() {
     info "Setting up passwordless openfortivpn via polkit + sudoers..."
+
+    # 0. fix-sudo is meaningless without the binary — guarantee it first.
+    ensure_openfortivpn
 
     # 1. Polkit rule (for pkexec) — works regardless of sudo/doas choice.
     sudo mkdir -p "/etc/polkit-1/rules.d" 2>/dev/null \
@@ -436,14 +508,20 @@ SUDOERS
     fi
 
     echo ""
+    # When fix-sudo is invoked via `sudo bash install.sh fix-sudo`, plain
+    # `groups` reports root's groups. Always check the invoking user instead.
+    local INVOKING_USER="${SUDO_USER:-${USER:-$(id -un)}}"
+    local USER_GROUPS
+    USER_GROUPS=$(id -nG "$INVOKING_USER" 2>/dev/null || echo "")
     info "Your user must be in the 'wheel' or 'sudo' group:"
-    info "  Current groups: $(groups)"
-    if groups | grep -qwE 'wheel|sudo'; then
+    info "  User: $INVOKING_USER"
+    info "  Groups: $USER_GROUPS"
+    if echo " $USER_GROUPS " | grep -qwE 'wheel|sudo'; then
         success "You are in the correct group."
     else
-        warn "You are NOT in wheel/sudo. Add yourself:"
-        warn "  sudo usermod -aG wheel \$USER   # Fedora/Arch"
-        warn "  sudo usermod -aG sudo \$USER    # Ubuntu/Debian"
+        warn "$INVOKING_USER is NOT in wheel/sudo. Add yourself:"
+        warn "  sudo usermod -aG wheel $INVOKING_USER   # Fedora/Arch"
+        warn "  sudo usermod -aG sudo $INVOKING_USER    # Ubuntu/Debian"
         warn "Then log out and back in."
     fi
 }
