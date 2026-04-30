@@ -77,6 +77,38 @@ log = logging.getLogger("fortivpn")
 
 
 # ---------------------------------------------------------------------------
+# Trusted-cert auto-capture
+#
+# When connecting to a gateway whose certificate is not yet whitelisted,
+# openfortivpn refuses the tunnel and prints the gateway's SHA-256 digest in
+# one of two forms:
+#   1. 64 contiguous hex chars, e.g. `sha256:abcdef...64hex`
+#   2. 32 colon-separated hex byte pairs, e.g. `AB:CD:EF:...:89` (×32)
+# CERT_DIGEST_RE matches either form. The lookarounds prevent partial matches
+# inside a longer hex/colon run. Captured strings are normalised by stripping
+# colons and lowercasing — the result is always 64 hex chars.
+#
+# CERT_ERROR_MARKERS gates the digest pickup: we only treat a hex match as a
+# digest when it appears AFTER one of these substrings has been seen on the
+# current process's output, so unrelated hex (PIDs, addresses, debug dumps)
+# never poisons the profile.
+# ---------------------------------------------------------------------------
+
+CERT_DIGEST_RE = re.compile(
+    r"(?<![0-9a-fA-F:])"
+    r"(?:[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){31}|[0-9a-fA-F]{64})"
+    r"(?![0-9a-fA-F:])"
+)
+
+CERT_ERROR_MARKERS = (
+    "certificate validation failed",
+    "gateway certificate",
+    "trusted-cert",
+    "certificate digest",
+)
+
+
+# ---------------------------------------------------------------------------
 # Flatpak sandbox awareness
 #
 # When the app runs inside a Flatpak sandbox we cannot exec openfortivpn
@@ -167,6 +199,17 @@ class VPNController:
         self.on_status_change: callable = None
         self.on_log_line: callable = None
         self.on_traffic_update: callable = None
+        self.on_cert_captured: callable = None
+
+        # Trusted-cert auto-capture state.
+        # _cert_retry_done: latched True after a digest is emitted, so a
+        #   second cert error during the same user-initiated connect cycle
+        #   never triggers a second auto-retry. Reset on user-initiated
+        #   connect() (i.e. _is_retry=False), preserved on auto-retry.
+        # _cert_error_seen: per-process flag — True once a cert-error marker
+        #   has been seen, so unrelated hex never gets picked up.
+        self._cert_retry_done = False
+        self._cert_error_seen = False
 
     @staticmethod
     def find_binary() -> str | None:
@@ -186,10 +229,18 @@ class VPNController:
 
     def connect(self, host: str, port: str, saml: bool = True,
                 realm: str = "", trusted_cert: str = "",
-                extra_args: list[str] | None = None):
+                extra_args: list[str] | None = None,
+                _is_retry: bool = False):
         if self.process and self.process.poll() is None:
             self._emit_log("Already connected or connecting.")
             return
+
+        # Loop guard: only reset on a fresh user-initiated connect. The auto
+        # cert-retry path passes _is_retry=True, preserving _cert_retry_done
+        # so a second cert mismatch during the retry cannot re-trigger.
+        if not _is_retry:
+            self._cert_retry_done = False
+        self._cert_error_seen = False
 
         binary = self.find_binary()
         if not binary:
@@ -258,6 +309,7 @@ class VPNController:
                     break
 
                 self._emit_log(line)
+                self._scan_cert(line)
 
                 # Detect the SAML auth URL from openfortivpn output
                 # openfortivpn prints: INFO: Authenticate at 'https://host:port/remote/saml/start?redirect=1'
@@ -338,6 +390,7 @@ class VPNController:
             for line in self.process.stdout:
                 line = line.rstrip("\n")
                 self._emit_log(line)
+                self._scan_cert(line)
 
                 if not browser_opened and ("Authenticate at" in line or "saml/start" in line):
                     url_match = re.search(r"'(https?://[^']+)'", line)
@@ -439,6 +492,30 @@ class VPNController:
         if self.on_status_change:
             GLib.idle_add(self.on_status_change, self.connected)
 
+    def _scan_cert(self, line: str):
+        """Watch a single output line for an openfortivpn cert-validation
+        error and the SHA-256 digest that follows. Fires on_cert_captured
+        at most once per user-initiated connect attempt."""
+        if self._cert_retry_done:
+            return
+        low = line.lower()
+        if not self._cert_error_seen:
+            for marker in CERT_ERROR_MARKERS:
+                if marker in low:
+                    self._cert_error_seen = True
+                    break
+        if not self._cert_error_seen:
+            return
+        m = CERT_DIGEST_RE.search(line)
+        if not m:
+            return
+        digest = m.group(0).replace(":", "").lower()
+        if len(digest) != 64:
+            return
+        self._cert_retry_done = True
+        if self.on_cert_captured:
+            GLib.idle_add(self.on_cert_captured, digest)
+
 
 # ---------------------------------------------------------------------------
 # Main Window
@@ -452,6 +529,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.vpn.on_status_change = self._on_vpn_status
         self.vpn.on_log_line = self._on_vpn_log
         self.vpn.on_traffic_update = self._on_traffic_update
+        self.vpn.on_cert_captured = self._on_cert_captured
         self.profiles = load_profiles()
 
         # UI state
@@ -462,6 +540,17 @@ class MainWindow(Adw.ApplicationWindow):
         self._last_sample: tuple[int, int, float] | None = None  # (tx, rx, t)
         self._tx_rate: float = 0.0
         self._rx_rate: float = 0.0
+
+        # Auto cert-capture retry coordination.
+        # _connecting_idx: which profile the most recent connect attempt
+        #   targets — needed by the cert-capture callback so it can write the
+        #   digest into the right profile.
+        # _cert_retry_pending: set in _on_cert_captured, drained in
+        #   _on_vpn_status(False) — we wait for the failed openfortivpn to
+        #   exit before respawning, otherwise the second sudo/pkexec races
+        #   the still-dying first one.
+        self._connecting_idx: int | None = None
+        self._cert_retry_pending: bool = False
 
         self._build_ui()
 
@@ -783,7 +872,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._nav.push(page)
 
     # ---- Connect ----
-    def _on_connect(self, idx):
+    def _on_connect(self, idx, _auto: bool = False):
         if self.vpn.connected:
             self.vpn.disconnect()
             return
@@ -793,6 +882,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._active_host = f"{p.get('host', '')}:{p.get('port', '443')}"
         self._connecting = True
+        self._connecting_idx = idx
         self._set_hero_state("connecting")
 
         self.vpn.connect(
@@ -802,8 +892,10 @@ class MainWindow(Adw.ApplicationWindow):
             realm=p.get("realm", ""),
             trusted_cert=p.get("trusted_cert", ""),
             extra_args=extra,
+            _is_retry=_auto,
         )
-        self._toast("Connecting\u2026")
+        if not _auto:
+            self._toast("Connecting\u2026")
 
     # ---- Hero card state ----
     def _set_hero_state(self, state: str):
@@ -870,10 +962,43 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_vpn_status(self, connected: bool):
         self._connecting = False
         if connected:
+            self._cert_retry_pending = False
             self._set_hero_state("connected")
             self._toast("Connected")
-        else:
-            self._set_hero_state("disconnected")
+            return
+        if self._cert_retry_pending:
+            # The failed openfortivpn just exited. Wait for the OS to fully
+            # reap it, then respawn with the freshly-captured trusted_cert.
+            self._set_hero_state("connecting")
+            GLib.timeout_add(150, self._retry_after_exit)
+            return
+        self._set_hero_state("disconnected")
+
+    def _on_cert_captured(self, digest: str):
+        """Controller callback: openfortivpn refused the gateway cert and we
+        scraped the digest out of its log. Persist it into the profile and
+        queue a one-shot reconnect."""
+        idx = self._connecting_idx
+        if idx is None or not (0 <= idx < len(self.profiles)):
+            return
+        # Persist BEFORE the retry: a crash between save and respawn must
+        # still leave the profile fixed for next time.
+        self.profiles[idx]["trusted_cert"] = digest
+        save_profiles(self.profiles)
+        self._refresh_profiles()
+        self._toast("Trusted certificate saved — reconnecting…")
+        self._cert_retry_pending = True
+        return False  # safe whether called via idle_add or directly
+
+    def _retry_after_exit(self):
+        proc = self.vpn.process
+        if proc is not None and proc.poll() is None:
+            return True  # still alive — keep polling
+        self._cert_retry_pending = False
+        idx = self._connecting_idx
+        if idx is not None and 0 <= idx < len(self.profiles):
+            self._on_connect(idx, _auto=True)
+        return False
 
     def _on_vpn_log(self, line: str):
         end = self._log_buf.get_end_iter()
