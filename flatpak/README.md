@@ -11,7 +11,7 @@ every distro.
 # From the repo root
 flatpak install --user flathub org.gnome.Platform//46 org.gnome.Sdk//46
 flatpak-builder --user --install --force-clean build \
-    FortiVPN/flatpak/com.github.fortivpn_client.yml
+    flatpak/com.github.fortivpn_client.yml
 ```
 
 ## Run
@@ -59,7 +59,7 @@ direct submission to Flathub. To pre-validate locally:
 
 ```bash
 flatpak run --command=appstreamcli org.flatpak.Builder validate \
-    FortiVPN/flatpak/com.github.fortivpn_client.metainfo.xml
+    flatpak/com.github.fortivpn_client.metainfo.xml
 flatpak run --command=desktop-file-validate org.flatpak.Builder \
-    FortiVPN/flatpak/com.github.fortivpn_client.desktop
+    flatpak/com.github.fortivpn_client.desktop
 ```

@@ -51,8 +51,8 @@ and how isolated you want the app to be:
 ```bash
 git clone https://github.com/fortivpn-client/fortivpn-client.git
 cd fortivpn-client
-chmod +x FortiVPN/install.sh
-./FortiVPN/install.sh install
+chmod +x ./install.sh
+././install.sh install
 ```
 
 The installer automatically detects your distribution and installs all
@@ -82,11 +82,11 @@ via `flatpak-spawn --host`, so the host system needs `openfortivpn` installed
 ```bash
 flatpak install --user flathub org.gnome.Platform//46 org.gnome.Sdk//46
 flatpak-builder --user --install --force-clean build \
-    FortiVPN/flatpak/com.github.fortivpn_client.yml
+    flatpak/com.github.fortivpn_client.yml
 flatpak run com.github.fortivpn_client
 ```
 
-See [`FortiVPN/flatpak/README.md`](flatpak/README.md) for build details and
+See [`flatpak/README.md`](flatpak/README.md) for build details and
 the flatpak-spawn host-bridge design.
 
 ### 3. Manual install

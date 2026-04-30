@@ -4,7 +4,7 @@
 # Supports: Ubuntu/Debian, Fedora/RHEL/CentOS, Arch Linux, openSUSE,
 #           Alpine Linux, Void Linux. Hints for Gentoo and NixOS.
 # Long-tail / unknown distros: prints required components and points to the
-# Flatpak (FortiVPN/flatpak/) which works identically on every distribution.
+# Flatpak (flatpak/) which works identically on every distribution.
 # ============================================================================
 set -euo pipefail
 
@@ -47,7 +47,7 @@ detect_distro() {
         warn "NixOS detected."
         warn "install.sh cannot manage packages on NixOS."
         warn "Use one of:"
-        warn "  • Flatpak (recommended):  see FortiVPN/flatpak/README.md"
+        warn "  • Flatpak (recommended):  see flatpak/README.md"
         warn "  • Write a flake / package: bundle openfortivpn + python3 +"
         warn "    pygobject3 + gtk4 + libadwaita + polkit yourself."
         error "Aborting on NixOS."
@@ -91,7 +91,7 @@ ensure_openfortivpn() {
             SU=$(_pick_root_helper); $SU xbps-install -Sy openfortivpn ;;
         gentoo)
             warn "Gentoo: install net-vpn/openfortivpn manually (review USE flags),"
-            warn "or use the Flatpak — see FortiVPN/flatpak/README.md."
+            warn "or use the Flatpak — see flatpak/README.md."
             error "openfortivpn is required and cannot be auto-installed on Gentoo." ;;
         *)
             case "$DISTRO_LIKE" in
@@ -111,7 +111,7 @@ ensure_openfortivpn() {
                 *)
                     warn "Unknown distro ($DISTRO_ID / $DISTRO_LIKE) — cannot auto-install openfortivpn."
                     warn "Install it manually with your distro's package manager, or use the"
-                    warn "Flatpak — see FortiVPN/flatpak/README.md."
+                    warn "Flatpak — see flatpak/README.md."
                     error "openfortivpn is required and could not be auto-installed." ;;
             esac
             ;;
@@ -255,7 +255,7 @@ generic_fallback_message() {
     warn ""
     warn "Or skip distro packaging entirely and use the Flatpak — it works"
     warn "identically on every distribution:"
-    warn "  see FortiVPN/flatpak/README.md"
+    warn "  see flatpak/README.md"
 }
 
 # Pick `sudo` or `doas` (Alpine/Void typically use doas). Fall back to running
