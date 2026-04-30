@@ -52,7 +52,7 @@ and how isolated you want the app to be:
 git clone https://github.com/fortivpn-client/fortivpn-client.git
 cd fortivpn-client
 chmod +x ./install.sh
-././install.sh install
+./install.sh install
 ```
 
 The installer automatically detects your distribution and installs all
