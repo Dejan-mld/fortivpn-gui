@@ -25,13 +25,51 @@ import shutil
 import webbrowser
 from pathlib import Path
 
-from gi.repository import Gtk, Adw, Gio, GLib
+from gi.repository import Gtk, Adw, Gio, GLib, Gdk
 
 APP_ID = "com.github.fortivpn_client"
 APP_NAME = "FortiVPN Client"
 APP_VERSION = "1.2.0"
+APP_ICON = "network-vpn-symbolic"
 CONFIG_DIR = Path(GLib.get_user_config_dir()) / "fortivpn-client"
 CONFIG_FILE = CONFIG_DIR / "profiles.json"
+
+CSS = b"""
+.hero-card {
+    border-radius: 14px;
+    padding: 22px 20px;
+    margin: 4px 0 4px 0;
+    transition: background 200ms ease;
+}
+.hero-card.connected {
+    background: alpha(@success_bg_color, 0.55);
+    color: @success_fg_color;
+}
+.hero-card.disconnected {
+    background: alpha(@card_bg_color, 1.0);
+}
+.hero-card.connecting {
+    background: alpha(@accent_bg_color, 0.55);
+    color: @accent_fg_color;
+}
+.hero-icon {
+    -gtk-icon-size: 56px;
+    opacity: 0.9;
+    margin-bottom: 6px;
+}
+.hero-title {
+    font-size: 20pt;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+}
+.hero-subtitle {
+    opacity: 0.75;
+    font-size: 11pt;
+}
+.hero-card button.disconnect-pill {
+    margin-top: 12px;
+}
+"""
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("fortivpn")
@@ -71,6 +109,17 @@ def fmt_bytes(b: int) -> str:
         return f"{b / 1024**2:.1f} MB"
     else:
         return f"{b / 1024**3:.2f} GB"
+
+
+def fmt_rate(bps: float) -> str:
+    if bps < 1024:
+        return f"{bps:.0f} B/s"
+    elif bps < 1024 ** 2:
+        return f"{bps / 1024:.1f} KB/s"
+    elif bps < 1024 ** 3:
+        return f"{bps / 1024**2:.1f} MB/s"
+    else:
+        return f"{bps / 1024**3:.2f} GB/s"
 
 
 # ---------------------------------------------------------------------------
@@ -353,12 +402,23 @@ class VPNController:
 
 class MainWindow(Adw.ApplicationWindow):
     def __init__(self, app, vpn: VPNController):
-        super().__init__(application=app, title=APP_NAME, default_width=480, default_height=640)
+        super().__init__(application=app, title=APP_NAME, default_width=440, default_height=680)
+        self.set_icon_name(APP_ICON)
         self.vpn = vpn
         self.vpn.on_status_change = self._on_vpn_status
         self.vpn.on_log_line = self._on_vpn_log
         self.vpn.on_traffic_update = self._on_traffic_update
         self.profiles = load_profiles()
+
+        # UI state
+        self._connecting = False
+        self._connect_started: float | None = None
+        self._tick_source: int | None = None
+        self._active_host: str = ""
+        self._last_sample: tuple[int, int, float] | None = None  # (tx, rx, t)
+        self._tx_rate: float = 0.0
+        self._rx_rate: float = 0.0
+
         self._build_ui()
 
     def _build_ui(self):
@@ -376,70 +436,135 @@ class MainWindow(Adw.ApplicationWindow):
         # Header
         header = Adw.HeaderBar()
         add_btn = Gtk.Button(icon_name="list-add-symbolic", tooltip_text="Add Profile")
+        add_btn.add_css_class("flat")
         add_btn.connect("clicked", self._on_add_profile)
         header.pack_start(add_btn)
 
-        menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic")
+        menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic", tooltip_text="Main Menu")
+        menu_btn.add_css_class("flat")
         menu = Gio.Menu()
-        menu.append("About", "app.about")
+        menu.append("About FortiVPN Client", "app.about")
         menu.append("Quit", "app.quit")
         menu_btn.set_menu_model(menu)
         header.pack_end(menu_btn)
         main_box.append(header)
 
-        # Status banner
-        self._status_banner = Adw.Banner(title="Disconnected", revealed=True)
-        self._status_banner.add_css_class("error")
-        main_box.append(self._status_banner)
-
         # Scrollable content
         scroll = Gtk.ScrolledWindow(vexpand=True)
-        clamp = Adw.Clamp(maximum_size=600)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        clamp = Adw.Clamp(maximum_size=560)
         scroll.set_child(clamp)
         main_box.append(scroll)
 
-        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
-                        margin_top=16, margin_bottom=16, margin_start=16, margin_end=16)
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
+                        margin_top=18, margin_bottom=18, margin_start=14, margin_end=14)
         clamp.set_child(inner)
 
-        # Profiles
-        self._profiles_group = Adw.PreferencesGroup(title="VPN Profiles")
-        self._profile_rows: list[Adw.ActionRow] = []
-        inner.append(self._profiles_group)
+        # ---- Hero status card ----
+        self._hero = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
+                             halign=Gtk.Align.FILL, valign=Gtk.Align.START)
+        self._hero.add_css_class("hero-card")
+        self._hero.add_css_class("disconnected")
 
-        # Traffic (hidden until connected)
-        self._traffic_group = Adw.PreferencesGroup(title="Traffic")
-        self._traffic_row = Adw.ActionRow(
-            title="\u2191 Sent: 0 B",
-            subtitle="\u2193 Received: 0 B",
-        )
-        self._traffic_row.add_prefix(Gtk.Image(icon_name="network-transmit-receive-symbolic"))
-        self._traffic_group.add(self._traffic_row)
-        self._traffic_group.set_visible(False)
-        inner.append(self._traffic_group)
+        self._hero_icon = Gtk.Image(icon_name="network-vpn-disconnected-symbolic")
+        self._hero_icon.add_css_class("hero-icon")
+        self._hero_icon.set_halign(Gtk.Align.CENTER)
+        self._hero.append(self._hero_icon)
 
-        # Disconnect button (hidden until connected)
+        self._hero_title = Gtk.Label(label="Disconnected", halign=Gtk.Align.CENTER)
+        self._hero_title.add_css_class("hero-title")
+        self._hero.append(self._hero_title)
+
+        self._hero_subtitle = Gtk.Label(label="No active connection",
+                                        halign=Gtk.Align.CENTER, wrap=True,
+                                        justify=Gtk.Justification.CENTER)
+        self._hero_subtitle.add_css_class("hero-subtitle")
+        self._hero.append(self._hero_subtitle)
+
         self._disconnect_btn = Gtk.Button(label="Disconnect")
         self._disconnect_btn.add_css_class("destructive-action")
         self._disconnect_btn.add_css_class("pill")
+        self._disconnect_btn.add_css_class("disconnect-pill")
         self._disconnect_btn.set_halign(Gtk.Align.CENTER)
-        self._disconnect_btn.set_margin_top(8)
         self._disconnect_btn.set_visible(False)
         self._disconnect_btn.connect("clicked", lambda *_: self.vpn.disconnect())
-        inner.append(self._disconnect_btn)
+        self._hero.append(self._disconnect_btn)
 
-        # Connection log
-        log_group = Adw.PreferencesGroup(title="Connection Log")
+        inner.append(self._hero)
+
+        # ---- Profiles ----
+        self._profiles_stack = Gtk.Stack()
+        self._profiles_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self._profiles_stack.set_transition_duration(150)
+
+        # Empty state
+        empty = Adw.StatusPage(
+            icon_name="network-vpn-symbolic",
+            title="No VPN profiles",
+            description="Add your first profile to get started",
+        )
+        empty.set_vexpand(False)
+        empty_btn = Gtk.Button(label="Add Profile")
+        empty_btn.add_css_class("suggested-action")
+        empty_btn.add_css_class("pill")
+        empty_btn.set_halign(Gtk.Align.CENTER)
+        empty_btn.connect("clicked", self._on_add_profile)
+        empty.set_child(empty_btn)
+        self._profiles_stack.add_named(empty, "empty")
+
+        # Populated state
+        self._profiles_group = Adw.PreferencesGroup(
+            title="Profiles",
+            description="Select a profile to connect",
+        )
+        self._profile_rows: list[Adw.ActionRow] = []
+        self._profiles_stack.add_named(self._profiles_group, "list")
+
+        inner.append(self._profiles_stack)
+
+        # ---- Traffic ----
+        self._traffic_group = Adw.PreferencesGroup(title="Traffic")
+
+        self._tx_row = Adw.ActionRow(title="0 B", subtitle="0 B/s")
+        tx_icon = Gtk.Image(icon_name="go-up-symbolic")
+        tx_icon.add_css_class("dim-label")
+        self._tx_row.add_prefix(tx_icon)
+        self._traffic_group.add(self._tx_row)
+
+        self._rx_row = Adw.ActionRow(title="0 B", subtitle="0 B/s")
+        rx_icon = Gtk.Image(icon_name="go-down-symbolic")
+        rx_icon.add_css_class("dim-label")
+        self._rx_row.add_prefix(rx_icon)
+        self._traffic_group.add(self._rx_row)
+
+        self._traffic_group.set_visible(False)
+        inner.append(self._traffic_group)
+
+        # ---- Log (collapsed by default) ----
+        log_group = Adw.PreferencesGroup()
+        self._log_expander = Adw.ExpanderRow(
+            title="Show log",
+            subtitle="Connection diagnostics from openfortivpn",
+        )
+        log_group.add(self._log_expander)
         inner.append(log_group)
 
-        log_scroll = Gtk.ScrolledWindow(min_content_height=180, max_content_height=300)
+        log_scroll = Gtk.ScrolledWindow(min_content_height=180, max_content_height=320)
         log_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        log_scroll.set_margin_top(2)
+        log_scroll.set_margin_bottom(8)
+        log_scroll.set_margin_start(12)
+        log_scroll.set_margin_end(12)
         tv = Gtk.TextView(editable=False, cursor_visible=False, wrap_mode=Gtk.WrapMode.WORD_CHAR,
                           monospace=True, top_margin=8, bottom_margin=8,
                           left_margin=8, right_margin=8)
         tv.add_css_class("card")
         log_scroll.set_child(tv)
-        log_group.add(log_scroll)
+
+        log_holder = Gtk.ListBoxRow(activatable=False, selectable=False)
+        log_holder.set_child(log_scroll)
+        self._log_expander.add_row(log_holder)
+
         self._log_buf = tv.get_buffer()
         self._log_tv = tv
 
@@ -454,11 +579,10 @@ class MainWindow(Adw.ApplicationWindow):
         self._profile_rows.clear()
 
         if not self.profiles:
-            row = Adw.ActionRow(title="No profiles yet", subtitle="Click + to add one")
-            row.set_sensitive(False)
-            self._profiles_group.add(row)
-            self._profile_rows.append(row)
+            self._profiles_stack.set_visible_child_name("empty")
             return
+
+        self._profiles_stack.set_visible_child_name("list")
 
         for i, p in enumerate(self.profiles):
             saml = p.get("saml", True)
@@ -468,18 +592,39 @@ class MainWindow(Adw.ApplicationWindow):
 
             row = Adw.ActionRow(title=p.get("name", "Unnamed"), subtitle=sub, activatable=True)
             row.add_prefix(Gtk.Image(icon_name="network-vpn-symbolic"))
+            row.connect("activated", lambda _r, idx=i: self._on_connect(idx))
 
-            for icon, tip, cb in [
-                ("media-playback-start-symbolic", "Connect", lambda _b, idx=i: self._on_connect(idx)),
-                ("document-edit-symbolic", "Edit", lambda _b, idx=i: self._open_editor(idx)),
-                ("user-trash-symbolic", "Delete", lambda _b, idx=i: self._on_delete(idx)),
-            ]:
-                btn = Gtk.Button(icon_name=icon, valign=Gtk.Align.CENTER, tooltip_text=tip)
-                btn.add_css_class("flat")
-                btn.connect("clicked", cb)
-                row.add_suffix(btn)
+            # Per-row action menu (Edit / Delete) collapsed under view-more
+            popover = Gtk.Popover()
+            pop_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            pop_box.set_margin_top(4)
+            pop_box.set_margin_bottom(4)
+            pop_box.set_margin_start(4)
+            pop_box.set_margin_end(4)
+            popover.set_child(pop_box)
 
-            row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+            edit_btn = Gtk.Button(label="Edit")
+            edit_btn.add_css_class("flat")
+            edit_btn.connect("clicked", lambda _b, idx=i, pop=popover:
+                             (pop.popdown(), self._open_editor(idx)))
+            pop_box.append(edit_btn)
+
+            del_btn = Gtk.Button(label="Delete")
+            del_btn.add_css_class("flat")
+            del_btn.add_css_class("destructive-action")
+            del_btn.connect("clicked", lambda _b, idx=i, pop=popover:
+                            (pop.popdown(), self._on_delete(idx)))
+            pop_box.append(del_btn)
+
+            mb = Gtk.MenuButton(
+                icon_name="view-more-symbolic",
+                valign=Gtk.Align.CENTER,
+                tooltip_text="More actions",
+            )
+            mb.add_css_class("flat")
+            mb.set_popover(popover)
+            row.add_suffix(mb)
+
             self._profiles_group.add(row)
             self._profile_rows.append(row)
 
@@ -546,9 +691,20 @@ class MainWindow(Adw.ApplicationWindow):
         realm_r = Adw.EntryRow(title="Realm (optional)")
         realm_r.set_text(p.get("realm", ""))
         g2.add(realm_r)
-        cert_r = Adw.EntryRow(title="Trusted Cert Hash (optional)")
+        cert_r = Adw.EntryRow(title="Trusted Cert Hash")
         cert_r.set_text(p.get("trusted_cert", ""))
         g2.add(cert_r)
+        # Hint row explaining auto-capture
+        cert_hint = Adw.ActionRow(
+            title="Captured automatically on first connection",
+            subtitle="Usually empty — openfortivpn will fill this for you",
+            sensitive=False,
+        )
+        cert_hint.add_css_class("dim-label")
+        info_icon = Gtk.Image(icon_name="dialog-information-symbolic")
+        info_icon.add_css_class("dim-label")
+        cert_hint.add_prefix(info_icon)
+        g2.add(cert_hint)
         form.append(g2)
 
         # Advanced
@@ -591,6 +747,10 @@ class MainWindow(Adw.ApplicationWindow):
         p = self.profiles[idx]
         extra = p.get("extra_args", "").split() if p.get("extra_args") else []
 
+        self._active_host = f"{p.get('host', '')}:{p.get('port', '443')}"
+        self._connecting = True
+        self._set_hero_state("connecting")
+
         self.vpn.connect(
             host=p["host"],
             port=p.get("port", "443"),
@@ -599,23 +759,77 @@ class MainWindow(Adw.ApplicationWindow):
             trusted_cert=p.get("trusted_cert", ""),
             extra_args=extra,
         )
-        self._toast("Starting connection...")
+        self._toast("Connecting\u2026")
+
+    # ---- Hero card state ----
+    def _set_hero_state(self, state: str):
+        for cls in ("connected", "disconnected", "connecting"):
+            self._hero.remove_css_class(cls)
+        self._hero.add_css_class(state)
+
+        if state == "connected":
+            self._hero_icon.set_from_icon_name("network-vpn-symbolic")
+            self._hero_title.set_label("Connected")
+            self._hero_subtitle.set_label(self._active_host or "")
+            self._disconnect_btn.set_visible(True)
+            self._traffic_group.set_visible(True)
+            self._start_tick()
+        elif state == "connecting":
+            self._hero_icon.set_from_icon_name("network-vpn-acquiring-symbolic")
+            self._hero_title.set_label("Connecting\u2026")
+            self._hero_subtitle.set_label(self._active_host or "Establishing tunnel")
+            self._disconnect_btn.set_visible(False)
+            self._traffic_group.set_visible(False)
+            self._stop_tick()
+        else:  # disconnected
+            self._hero_icon.set_from_icon_name("network-vpn-disconnected-symbolic")
+            self._hero_title.set_label("Disconnected")
+            self._hero_subtitle.set_label("No active connection")
+            self._disconnect_btn.set_visible(False)
+            self._traffic_group.set_visible(False)
+            self._stop_tick()
+            self._reset_traffic_view()
+
+    def _start_tick(self):
+        self._connect_started = time.monotonic()
+        if self._tick_source is None:
+            self._tick_source = GLib.timeout_add_seconds(1, self._tick)
+        self._tick()
+
+    def _stop_tick(self):
+        if self._tick_source is not None:
+            GLib.source_remove(self._tick_source)
+            self._tick_source = None
+        self._connect_started = None
+
+    def _tick(self):
+        if not self.vpn.connected or self._connect_started is None:
+            return False
+        elapsed = int(time.monotonic() - self._connect_started)
+        h, rem = divmod(elapsed, 3600)
+        m, s = divmod(rem, 60)
+        time_str = f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+        host = self._active_host or ""
+        self._hero_subtitle.set_label(f"{host}  \u2022  {time_str}" if host else time_str)
+        return True
+
+    def _reset_traffic_view(self):
+        self._tx_row.set_title("0 B")
+        self._tx_row.set_subtitle("0 B/s")
+        self._rx_row.set_title("0 B")
+        self._rx_row.set_subtitle("0 B/s")
+        self._last_sample = None
+        self._tx_rate = 0.0
+        self._rx_rate = 0.0
 
     # ---- Callbacks ----
     def _on_vpn_status(self, connected: bool):
+        self._connecting = False
         if connected:
-            self._status_banner.set_title("  Connected")
-            self._status_banner.remove_css_class("error")
-            self._status_banner.add_css_class("success")
-            self._traffic_group.set_visible(True)
-            self._disconnect_btn.set_visible(True)
-            self._toast("VPN tunnel is up!")
+            self._set_hero_state("connected")
+            self._toast("Connected")
         else:
-            self._status_banner.set_title("  Disconnected")
-            self._status_banner.remove_css_class("success")
-            self._status_banner.add_css_class("error")
-            self._traffic_group.set_visible(False)
-            self._disconnect_btn.set_visible(False)
+            self._set_hero_state("disconnected")
 
     def _on_vpn_log(self, line: str):
         end = self._log_buf.get_end_iter()
@@ -624,8 +838,19 @@ class MainWindow(Adw.ApplicationWindow):
         self._log_tv.scroll_to_mark(mark, 0.0, False, 0.0, 1.0)
 
     def _on_traffic_update(self, tx: int, rx: int):
-        self._traffic_row.set_title(f"\u2191  Sent: {fmt_bytes(tx)}")
-        self._traffic_row.set_subtitle(f"\u2193  Received: {fmt_bytes(rx)}")
+        now = time.monotonic()
+        if self._last_sample is not None:
+            ptx, prx, pt = self._last_sample
+            dt = now - pt
+            if dt > 0:
+                self._tx_rate = max(0.0, (tx - ptx) / dt)
+                self._rx_rate = max(0.0, (rx - prx) / dt)
+        self._last_sample = (tx, rx, now)
+
+        self._tx_row.set_title(fmt_bytes(tx))
+        self._tx_row.set_subtitle(fmt_rate(self._tx_rate))
+        self._rx_row.set_title(fmt_bytes(rx))
+        self._rx_row.set_subtitle(fmt_rate(self._rx_rate))
 
     def _toast(self, msg: str):
         self._toast_overlay.add_toast(Adw.Toast(title=msg, timeout=3))
@@ -651,12 +876,22 @@ class FortiVPNApp(Adw.Application):
 
     def do_activate(self):
         if not self.win:
+            self._install_css()
             self.win = MainWindow(self, self.vpn)
         self.win.present()
 
+    def _install_css(self):
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(),
+            provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+
     def _on_about(self, *_):
         Adw.AboutDialog(
-            application_name=APP_NAME, application_icon="network-vpn",
+            application_name=APP_NAME, application_icon=APP_ICON,
             version=APP_VERSION, developer_name="FortiVPN Client Contributors",
             license_type=Gtk.License.GPL_3_0,
             website="https://github.com/fortivpn-client/fortivpn-client",
